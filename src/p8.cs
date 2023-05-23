@@ -59,7 +59,7 @@ public readonly struct p8 {
 
         // fraction is max(0,n-3-es) bits, any past end are 0
         int fraction = 0;
-        int mantissaBits = Math.Max(0, BITS - 3 - EXPONENT_SIZE); // # frac bits
+        int mantissaBits = Math.Max(0, BITS - 3 - EXPONENT_SIZE); // # fraction bits
         for (int z = 0; z < mantissaBits; ++z) {
             // get valid bits if any, else 0
             int bit = bitIndex >= 0 ? Bit(lBits, bitIndex) : 0;
@@ -84,6 +84,77 @@ public readonly struct p8 {
 
     public static implicit operator float(p8 value) => value.ToSingle();
 
+    public static explicit operator p8(double value) {
+        // from https://github.com/ChrisLomont/LibPosit/blob/4b9f332bfb337852d8e7eca9890c06dc14bd2d74/Testing/Posit.cs#L169
+
+        // spec: 
+        // if x representable, return posit of x
+        // if |x| > max return max*sign(x)
+        // if |x| < min return min*sign(x)
+        // u,w are n bit posits st u < x < w and interval (u,v) has no other posits
+        // let U be the n-bit representation of u
+        // let v = n+1 bit posit with rep U1  (U append 1)
+        // if u < x < v or (x==v && LSB(u) == 0) then
+        //   return u
+        // else
+        //   return w
+
+        if (value == 0) return Zero;
+
+        if (!double.IsFinite(value)) return NaR;
+
+        uint bits;
+        int me = (1 << EXPONENT_SIZE) * (BITS - 2);
+        double epsilon = Math.Pow(2, -me); // exact?
+        double max = 1 / epsilon; // exact
+        if (Math.Abs(value) >= max) {
+            bits = (1U << (BITS - 1)) - 1;
+            if (value < 0) bits = ~bits + 1;
+            bits &= (1U << BITS) - 1;
+            return new((byte)bits);
+        }
+        if (Math.Abs(value) < epsilon) {
+            bits = 1;
+            if (value < 0) bits = ~bits + 1;
+            bits &= (1U << BITS) - 1;
+            return new((byte)bits);
+        }
+
+        // IEEE 754 float64 format:
+        // 1 sign bit, 11 exponent bits, 52 fraction bits
+        ulong b64 = BitConverter.DoubleToUInt64Bits(value);
+        ulong e64 = (b64 >> 52) & ((1UL << 11) - 1); // exponent bits
+        ulong f64 = b64 & ((1UL << 52) - 1); // fraction bits
+
+        int e = ((int)e64) - 1023; // add exponent bias
+        int expSign = e < 0 ? 1 : 0;
+        int k = e >> EXPONENT_SIZE; // for useed^k calc
+
+        // create: 2 last regime bits, exponent bits, mantissa bits, at top of 64 bit value
+        ulong regBits = (1UL << 63) >> expSign; // 01000... for |x| < 1 else 1000....
+        ulong expBits = (ulong)(e & ((1 << EXPONENT_SIZE) - 1));
+        expBits <<= 64 - 2 - EXPONENT_SIZE; // align
+        ulong fractionBits = f64 << (11 - EXPONENT_SIZE - 1); // # bits for float64 exponent
+
+        ulong bits64 = regBits | expBits | fractionBits;
+        bits64 = (ulong)(((long)bits64) >>
+                         (Math.Abs(k + 1) + expSign)); // treat as signed to extend bits
+        bits64 &= ~(1UL << 63); // remove possible leftover sign
+
+        // round to nearest n-bit posit
+        ulong rounded = RoundBits(BITS, bits64);
+
+        // no underflow or overflow
+        int kmax = (1023 >> EXPONENT_SIZE) + 1; // check unbounded
+        if (BITS <= Math.Abs(k) && Math.Abs(k) < kmax)
+            rounded = (ulong)((long)rounded - Math.Sign(k));
+
+        if (value < 0)
+            rounded = (ulong)(-(long)rounded); // two's complement for neg
+        bits = (uint)rounded & ((1U << BITS) - 1);
+        return new((byte)bits);
+    }
+
     public override string ToString() => this.IsNaR ? "NaR" : this.ToSingle().ToString();
     public override int GetHashCode() => this.Byte.GetHashCode();
 
@@ -94,6 +165,32 @@ public readonly struct p8 {
 
         byte mask = (byte)(1 << index);
         return (v & mask) >> index;
+    }
+
+    // round long representation to desired length
+    static ulong RoundBits(int bitLen, ulong positBits64) {
+        // rules from standard 2022
+        // u,w are n bit posits st u < x < w and interval (u,v) has no other posits
+        // let U be the n-bit representation of u
+        // let v = n+1 bit posit with rep U1  (U append 1)
+        // if u < x < v or (x==v && LSB(u) == 0) then
+        //   return u
+        // else
+        //   return w
+
+        int dBits = 64 - bitLen;
+        if (positBits64 == (1UL << 63) >> bitLen)
+            // special case: if value is 1/2 ulp, rounds up, not down ?!
+            return (positBits64 * 2) >> dBits;
+
+        // bankers rounding
+        ulong halfUlp = ((1UL << 63) - 1) >> bitLen; // ...0007ffff... just less than ulp/2
+        halfUlp += (positBits64 >> dBits) & 1; // odd is 008000.. (round up for tie)
+        //var t1 = positBits64 >> dBits;
+        positBits64 += halfUlp; // add half up
+        //var t2 = positBits64 >> dBits;
+        //if (t1 != t2) Console.Write($" - round up - ");
+        return positBits64 >> dBits;
     }
     #endregion Utility functions
 
